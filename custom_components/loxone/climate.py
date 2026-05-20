@@ -30,7 +30,6 @@ try:
         AIRZONE_GLOBAL_MODE_UUID,
         AIRZONE_MASTER_SETPOINT_UUID,
         AIRZONE_MODE_TO_VALUE,
-        AIRZONE_VALUE_TO_MODE,
         AIRZONE_ZONE_OFFSET,
         AIRZONE_ZONES,
     )
@@ -112,6 +111,28 @@ def _state_uuid(controls: dict, command_uuid: str, state_key: str) -> str:
         command_uuid, state_key,
     )
     return command_uuid
+
+
+def _airzone_mode_from_value(val: int) -> HVACMode:
+    """Map a Radio activeOutput Modbus register value to an HVACMode.
+
+    Register values mirror Modbus, not sequential output indices:
+      0         → (no active output / stop) — treated as cool as a neutral fallback
+      1         → Cool
+      3         → Fan only
+      5         → Heat (standard encoding)
+      6         → Dry
+      > 6       → Heat (alternative Airzone/Modbus encoding, e.g. 258)
+    """
+    if val == 1:
+        return HVACMode.COOL
+    if val == 3:
+        return HVACMode.FAN_ONLY
+    if val == 6:
+        return HVACMode.DRY
+    if val == 5 or val > 6:
+        return HVACMode.HEAT
+    return HVACMode.COOL  # val 0 or any unexpected value
 
 
 async def async_setup_entry(
@@ -792,12 +813,7 @@ class LoxoneAirzoneZone(ClimateEntity):
     def hvac_mode(self) -> HVACMode:
         if not self._switch_on:
             return HVACMode.OFF
-        return {
-            1: HVACMode.COOL,
-            3: HVACMode.FAN_ONLY,
-            5: HVACMode.HEAT,
-            6: HVACMode.DRY,
-        }.get(self._mode_value, HVACMode.COOL)
+        return _airzone_mode_from_value(self._mode_value)
 
     async def async_set_temperature(self, **kwargs) -> None:
         temp = kwargs.get("temperature")
