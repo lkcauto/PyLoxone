@@ -215,6 +215,8 @@ class LoxoneRoomController(LoxoneEntity, ClimateEntity, ABC):
         )
 
     async def event_handler(self, event):
+        if not self.enabled:
+            return
         update = False
 
         for key in self._all_uuids & event.data.keys():
@@ -374,6 +376,8 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
                 return mode["name"]
 
     async def event_handler(self, event):
+        if not self.enabled:
+            return
         update = False
         for key in set(self._stateAttribUuids.values()) & event.data.keys():
             self._stateAttribValues[key] = event.data[key]
@@ -509,6 +513,8 @@ class LoxoneAcControl(LoxoneEntity, ClimateEntity, ABC):
         )
 
     async def event_handler(self, event):
+        if not self.enabled:
+            return
         update = False
         for key in set(self._stateAttribUuids.values()) & event.data.keys():
             self._stateAttribValues[key] = event.data[key]
