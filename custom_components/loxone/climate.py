@@ -79,13 +79,39 @@ async def async_setup_platform(
 
 
 def _find_control(controls: dict, target_uuid: str) -> dict:
-    """Return the control entry for target_uuid, checking dict key and uuidAction."""
+    """Return the loxconfig control entry for target_uuid.
+
+    Checks both the dict key (common case) and the uuidAction field
+    (fallback) so lookup works regardless of how the JSON is structured.
+    """
     if target_uuid in controls:
         return controls[target_uuid]
     for ctrl in controls.values():
         if ctrl.get("uuidAction") == target_uuid:
             return ctrl
     return {}
+
+
+def _state_uuid(controls: dict, command_uuid: str, state_key: str) -> str:
+    """Return the state output UUID for a block, falling back to command_uuid.
+
+    Loxone block types and their state key names:
+      InfoOnlyAnalog  → "value"
+      ValueSelector   → "value"
+      Switch          → "active"
+      Radio           → "activeOutput"
+    """
+    ctrl = _find_control(controls, command_uuid)
+    resolved = ctrl.get("states", {}).get(state_key)
+    if resolved:
+        _LOGGER.debug("Airzone UUID resolved: %s → %s (key=%s)", command_uuid, resolved, state_key)
+        return resolved
+    _LOGGER.warning(
+        "Airzone: could not resolve state UUID for %s (key=%s); "
+        "state updates from Loxone may not work for this block",
+        command_uuid, state_key,
+    )
+    return command_uuid
 
 
 async def async_setup_entry(
@@ -130,24 +156,27 @@ async def async_setup_entry(
     if _HAS_AIRZONE:
         controls = loxconfig.get("controls", {})
 
-        # Radio block: state events arrive on states["activeOutput"], not on the command UUID
-        mode_ctrl = _find_control(controls, AIRZONE_GLOBAL_MODE_UUID)
-        mode_state_uuid = mode_ctrl.get("states", {}).get("activeOutput", AIRZONE_GLOBAL_MODE_UUID)
-        _LOGGER.debug("Airzone AC mode state UUID: %s (ctrl=%s)", mode_state_uuid, AIRZONE_GLOBAL_MODE_UUID)
+        # Resolve shared state UUIDs (same block for all zones)
+        # Radio block: activeOutput carries the selected mode number
+        mode_state_uuid = _state_uuid(controls, AIRZONE_GLOBAL_MODE_UUID, "activeOutput")
+        # Master setpoint ValueSelector: value carries the current setpoint
+        master_setpoint_state_uuid = _state_uuid(controls, AIRZONE_MASTER_SETPOINT_UUID, "value")
 
         for zone_cfg in AIRZONE_ZONES:
-            # Switch block: state events arrive on states["active"], not on the command UUID
-            switch_ctrl = _find_control(controls, zone_cfg["switch_uuid"])
-            switch_state_uuid = switch_ctrl.get("states", {}).get("active", zone_cfg["switch_uuid"])
-            _LOGGER.debug(
-                "Airzone %s switch state UUID: %s (ctrl=%s)",
-                zone_cfg["name"], switch_state_uuid, zone_cfg["switch_uuid"],
-            )
+            # InfoOnlyAnalog temperature sensor: value carries the current reading
+            temp_state_uuid = _state_uuid(controls, zone_cfg["temperature_uuid"], "value")
+            # ValueSelector setpoint: value carries the current setpoint
+            setpoint_state_uuid = _state_uuid(controls, zone_cfg["setpoint_uuid"], "value")
+            # Switch damper block: active carries 0.0/1.0 on/off state
+            switch_state_uuid = _state_uuid(controls, zone_cfg["switch_uuid"], "active")
 
             enriched_cfg = {
                 **zone_cfg,
+                "temp_state_uuid": temp_state_uuid,
+                "setpoint_state_uuid": setpoint_state_uuid,
                 "switch_state_uuid": switch_state_uuid,
                 "mode_state_uuid": mode_state_uuid,
+                "master_setpoint_state_uuid": master_setpoint_state_uuid,
             }
             entities.append(LoxoneAirzoneZone(hass, enriched_cfg))
 
@@ -621,6 +650,9 @@ class LoxoneAirzoneZone(ClimateEntity):
     Non-master zones control only their damper and setpoint; their min/max
     temperature range tracks the master setpoint ± AIRZONE_ZONE_OFFSET so that
     HA's UI slider always enforces the Airzone hardware constraint.
+
+    Command UUIDs (uuidAction) are kept separately from state UUIDs (states dict)
+    because Loxone uses different UUIDs for sending commands vs receiving state events.
     """
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -639,14 +671,19 @@ class LoxoneAirzoneZone(ClimateEntity):
         self._room = zone_cfg["room"]
         self._is_master = zone_cfg["is_master"]
 
-        self._temp_uuid = zone_cfg["temperature_uuid"]
-        self._setpoint_uuid = zone_cfg["setpoint_uuid"]
-        # Command UUID — used to send on/off to the damper Switch block
-        self._switch_uuid = zone_cfg["switch_uuid"]
-        # State UUID — the Switch block's states["active"] output UUID; different from command UUID
+        # Command UUIDs — used to send commands to Loxone (uuidAction)
+        self._switch_uuid = zone_cfg["switch_uuid"]           # Switch damper on/off
+        self._setpoint_uuid = zone_cfg["setpoint_uuid"]       # ValueSelector set value
+        # AIRZONE_GLOBAL_MODE_UUID used directly when firing mode commands
+
+        # State UUIDs — the block's states dict output UUIDs; what Loxone uses in WebSocket events
+        self._temp_state_uuid = zone_cfg.get("temp_state_uuid", zone_cfg["temperature_uuid"])
+        self._setpoint_state_uuid = zone_cfg.get("setpoint_state_uuid", zone_cfg["setpoint_uuid"])
         self._switch_state_uuid = zone_cfg.get("switch_state_uuid", zone_cfg["switch_uuid"])
-        # State UUID — the Radio block's states["activeOutput"] output UUID; different from command UUID
         self._mode_state_uuid = zone_cfg.get("mode_state_uuid", AIRZONE_GLOBAL_MODE_UUID)
+        self._master_setpoint_state_uuid = zone_cfg.get(
+            "master_setpoint_state_uuid", AIRZONE_MASTER_SETPOINT_UUID
+        )
 
         # Absolute hardware limits for this zone
         self._abs_min = zone_cfg["setpoint_min"]
@@ -677,11 +714,11 @@ class LoxoneAirzoneZone(ClimateEntity):
         }
 
         self._watched_uuids = {
-            self._temp_uuid,
-            self._setpoint_uuid,
+            self._temp_state_uuid,
+            self._setpoint_state_uuid,
             self._switch_state_uuid,
             self._mode_state_uuid,
-            AIRZONE_MASTER_SETPOINT_UUID,
+            self._master_setpoint_state_uuid,
         }
         self._listener = None
 
@@ -699,13 +736,13 @@ class LoxoneAirzoneZone(ClimateEntity):
         if not (self._watched_uuids & data.keys()):
             return
 
-        if self._temp_uuid in data:
-            val = data[self._temp_uuid]
+        if self._temp_state_uuid in data:
+            val = data[self._temp_state_uuid]
             self._current_temp = float(val) if val is not None else None
             updated = True
 
-        if self._setpoint_uuid in data:
-            val = data[self._setpoint_uuid]
+        if self._setpoint_state_uuid in data:
+            val = data[self._setpoint_state_uuid]
             self._target_temp = float(val) if val is not None else None
             updated = True
 
@@ -717,8 +754,8 @@ class LoxoneAirzoneZone(ClimateEntity):
             self._mode_value = int(data[self._mode_state_uuid])
             updated = True
 
-        if AIRZONE_MASTER_SETPOINT_UUID in data:
-            val = data[AIRZONE_MASTER_SETPOINT_UUID]
+        if self._master_setpoint_state_uuid in data:
+            val = data[self._master_setpoint_state_uuid]
             self._master_setpoint = float(val) if val is not None else None
             updated = True
 
