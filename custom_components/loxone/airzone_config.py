@@ -12,12 +12,18 @@ Airzone mode values (sent to the Radio block):
   5 = Heat
   6 = Dry
 
-To verify values, watch the TextState 'AC mode' block in the Loxone app
-while switching modes manually, then match to what the Radio block receives.
+Non-master zone setpoints are always constrained to master_setpoint ± AIRZONE_ZONE_OFFSET.
+This matches the Airzone hardware limit (3°C either side of master).
 """
 
 # UUID of the Radio block that sets the global AC operating mode (shared by all zones)
 AIRZONE_GLOBAL_MODE_UUID = "20348b9e-02d8-61ca-ffff4a67748f279a"
+
+# UUID of the master zone setpoint — non-master zones track this for their min/max limits
+AIRZONE_MASTER_SETPOINT_UUID = "20347d11-0155-ea6f-ffff5b4be2d603d4"
+
+# How far a non-master zone setpoint can deviate from the master (Airzone hardware limit)
+AIRZONE_ZONE_OFFSET = 3.0
 
 # Mapping from HA HVACMode names to the numeric value sent to the Radio block
 AIRZONE_MODE_TO_VALUE: dict[str, int] = {
@@ -37,7 +43,8 @@ AIRZONE_VALUE_TO_MODE: dict[int, str] = {
 }
 
 # One entry per Airzone zone.
-# is_master=True zone controls the global AC mode; non-master zones control damper + setpoint only.
+# is_master=True zone controls the global AC mode and setpoint anchor.
+# Non-master zone min/max are computed dynamically as master_setpoint ± AIRZONE_ZONE_OFFSET.
 AIRZONE_ZONES: list[dict] = [
     {
         "name": "Master Suite AC",
