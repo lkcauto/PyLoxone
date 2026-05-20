@@ -1,0 +1,78 @@
+"""
+Airzone AC zone configuration for this Loxone installation.
+
+Edit the UUIDs below to match your LoxApp3.json.
+Find UUIDs in Loxone Config or via: lox ls -o json | python3 -c
+  "import json,sys; d=json.load(sys.stdin); [print(v['type'], v['name'], k) for k,v in d['controls'].items()]"
+
+Airzone mode values (sent to the Radio block):
+  0 = allOff / stop
+  1 = Cool
+  3 = Fan only
+  5 = Heat
+  6 = Dry
+
+To verify values, watch the TextState 'AC mode' block in the Loxone app
+while switching modes manually, then match to what the Radio block receives.
+"""
+
+# UUID of the Radio block that sets the global AC operating mode (shared by all zones)
+AIRZONE_GLOBAL_MODE_UUID = "20348b9e-02d8-61ca-ffff4a67748f279a"
+
+# Mapping from HA HVACMode names to the numeric value sent to the Radio block
+AIRZONE_MODE_TO_VALUE: dict[str, int] = {
+    "cool": 1,
+    "heat": 5,
+    "fan_only": 3,
+    "dry": 6,
+    "off": 0,
+}
+
+# Reverse mapping: Radio block value -> HA HVACMode name
+AIRZONE_VALUE_TO_MODE: dict[int, str] = {
+    1: "cool",
+    3: "fan_only",
+    5: "heat",
+    6: "dry",
+}
+
+# One entry per Airzone zone.
+# is_master=True zone controls the global AC mode; non-master zones control damper + setpoint only.
+AIRZONE_ZONES: list[dict] = [
+    {
+        "name": "Master Suite AC",
+        "unique_id": "airzone_master_suite",
+        "room": "Master Suite",
+        "is_master": True,
+        "temperature_uuid": "2034acd2-033e-466a-ffff4a67748f279a",
+        "setpoint_uuid": "20347d11-0155-ea6f-ffff5b4be2d603d4",
+        "switch_uuid": "1d5faa58-03e4-d9af-ffff4a67748f279a",
+        "setpoint_min": 16.0,
+        "setpoint_max": 30.0,
+        "setpoint_step": 0.5,
+    },
+    {
+        "name": "Living Room AC",
+        "unique_id": "airzone_living_room",
+        "room": "Living Room",
+        "is_master": False,
+        "temperature_uuid": "2034b111-03ba-7a35-ffff4a67748f279a",
+        "setpoint_uuid": "202e30d5-0260-c623-ffff4a67748f279a",
+        "switch_uuid": "1d5fbfcc-0362-0cac-ffff4a67748f279a",
+        "setpoint_min": 16.0,
+        "setpoint_max": 30.0,
+        "setpoint_step": 1.0,
+    },
+    {
+        "name": "Guest Suite AC",
+        "unique_id": "airzone_guest_suite",
+        "room": "Guest Suite",
+        "is_master": False,
+        "temperature_uuid": "2034ac18-0132-b918-ffff4a67748f279a",
+        "setpoint_uuid": "202e36f0-0086-d326-ffff3a8e542eca6a",
+        "switch_uuid": "20af9482-02a2-f6f7-ffff4a67748f279a",
+        "setpoint_min": 16.0,
+        "setpoint_max": 30.0,
+        "setpoint_step": 1.0,
+    },
+]
