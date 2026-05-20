@@ -78,6 +78,16 @@ async def async_setup_platform(
     return True
 
 
+def _find_control(controls: dict, target_uuid: str) -> dict:
+    """Return the control entry for target_uuid, checking dict key and uuidAction."""
+    if target_uuid in controls:
+        return controls[target_uuid]
+    for ctrl in controls.values():
+        if ctrl.get("uuidAction") == target_uuid:
+            return ctrl
+    return {}
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -117,8 +127,29 @@ async def async_setup_entry(
         )
         entities.append(LoxoneAcControl(**accontrol))
 
-    for zone_cfg in AIRZONE_ZONES:
-        entities.append(LoxoneAirzoneZone(hass, zone_cfg))
+    if _HAS_AIRZONE:
+        controls = loxconfig.get("controls", {})
+
+        # Radio block: state events arrive on states["activeOutput"], not on the command UUID
+        mode_ctrl = _find_control(controls, AIRZONE_GLOBAL_MODE_UUID)
+        mode_state_uuid = mode_ctrl.get("states", {}).get("activeOutput", AIRZONE_GLOBAL_MODE_UUID)
+        _LOGGER.debug("Airzone AC mode state UUID: %s (ctrl=%s)", mode_state_uuid, AIRZONE_GLOBAL_MODE_UUID)
+
+        for zone_cfg in AIRZONE_ZONES:
+            # Switch block: state events arrive on states["active"], not on the command UUID
+            switch_ctrl = _find_control(controls, zone_cfg["switch_uuid"])
+            switch_state_uuid = switch_ctrl.get("states", {}).get("active", zone_cfg["switch_uuid"])
+            _LOGGER.debug(
+                "Airzone %s switch state UUID: %s (ctrl=%s)",
+                zone_cfg["name"], switch_state_uuid, zone_cfg["switch_uuid"],
+            )
+
+            enriched_cfg = {
+                **zone_cfg,
+                "switch_state_uuid": switch_state_uuid,
+                "mode_state_uuid": mode_state_uuid,
+            }
+            entities.append(LoxoneAirzoneZone(hass, enriched_cfg))
 
     async_add_entities(entities)
 
@@ -610,7 +641,12 @@ class LoxoneAirzoneZone(ClimateEntity):
 
         self._temp_uuid = zone_cfg["temperature_uuid"]
         self._setpoint_uuid = zone_cfg["setpoint_uuid"]
+        # Command UUID — used to send on/off to the damper Switch block
         self._switch_uuid = zone_cfg["switch_uuid"]
+        # State UUID — the Switch block's states["active"] output UUID; different from command UUID
+        self._switch_state_uuid = zone_cfg.get("switch_state_uuid", zone_cfg["switch_uuid"])
+        # State UUID — the Radio block's states["activeOutput"] output UUID; different from command UUID
+        self._mode_state_uuid = zone_cfg.get("mode_state_uuid", AIRZONE_GLOBAL_MODE_UUID)
 
         # Absolute hardware limits for this zone
         self._abs_min = zone_cfg["setpoint_min"]
@@ -636,13 +672,15 @@ class LoxoneAirzoneZone(ClimateEntity):
             "platform": "loxone",
             "room": zone_cfg["room"],
             "is_master": self._is_master,
+            "switch_state_uuid": self._switch_state_uuid,
+            "mode_state_uuid": self._mode_state_uuid,
         }
 
         self._watched_uuids = {
             self._temp_uuid,
             self._setpoint_uuid,
-            self._switch_uuid,
-            AIRZONE_GLOBAL_MODE_UUID,
+            self._switch_state_uuid,
+            self._mode_state_uuid,
             AIRZONE_MASTER_SETPOINT_UUID,
         }
         self._listener = None
@@ -671,12 +709,12 @@ class LoxoneAirzoneZone(ClimateEntity):
             self._target_temp = float(val) if val is not None else None
             updated = True
 
-        if self._switch_uuid in data:
-            self._switch_on = bool(data[self._switch_uuid])
+        if self._switch_state_uuid in data:
+            self._switch_on = bool(data[self._switch_state_uuid])
             updated = True
 
-        if AIRZONE_GLOBAL_MODE_UUID in data:
-            self._mode_value = int(data[AIRZONE_GLOBAL_MODE_UUID])
+        if self._mode_state_uuid in data:
+            self._mode_value = int(data[self._mode_state_uuid])
             updated = True
 
         if AIRZONE_MASTER_SETPOINT_UUID in data:
