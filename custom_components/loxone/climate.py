@@ -585,7 +585,8 @@ class LoxoneAcControl(LoxoneEntity, ClimateEntity, ABC):
 class LoxoneAirzoneZone(ClimateEntity):
     """One Airzone zone: raw Loxone blocks (damper switch + setpoint + temp sensor).
 
-    The master zone (is_master=True) also controls the global AC operating mode.
+    All zones control the global AC operating mode — Loxone virtualises the AC Mode
+    Radio block to all zones, so any zone can change the global mode.
     Non-master zones control only their damper and setpoint; their min/max
     temperature range tracks the master setpoint ± AIRZONE_ZONE_OFFSET so that
     HA's UI slider always enforces the Airzone hardware constraint.
@@ -734,9 +735,8 @@ class LoxoneAirzoneZone(ClimateEntity):
             self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
         else:
             self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "on"})
-            if self._is_master:
-                mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
-                self.hass.bus.fire(
-                    SENDDOMAIN,
-                    {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val},
-                )
+            mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
+            self.hass.bus.fire(
+                SENDDOMAIN,
+                {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val},
+            )
