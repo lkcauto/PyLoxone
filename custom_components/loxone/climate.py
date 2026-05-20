@@ -627,7 +627,6 @@ class LoxoneAirzoneZone(ClimateEntity):
         self._target_temp: float | None = None
         self._switch_on: bool = False
         self._mode_value: int = 0
-        # Tracks master setpoint for non-master zone limit computation
         self._master_setpoint: float | None = None
 
         self._attr_device_info = get_or_create_device(
@@ -680,7 +679,6 @@ class LoxoneAirzoneZone(ClimateEntity):
             self._mode_value = int(data[AIRZONE_GLOBAL_MODE_UUID])
             updated = True
 
-        # All zones track the master setpoint so non-master min/max stay in sync
         if AIRZONE_MASTER_SETPOINT_UUID in data:
             val = data[AIRZONE_MASTER_SETPOINT_UUID]
             self._master_setpoint = float(val) if val is not None else None
@@ -693,14 +691,12 @@ class LoxoneAirzoneZone(ClimateEntity):
     def min_temp(self) -> float:
         if self._is_master or self._master_setpoint is None:
             return self._abs_min
-        # Non-master: clamp to absolute limits so we never go below hardware floor
         return max(self._abs_min, self._master_setpoint - AIRZONE_ZONE_OFFSET)
 
     @property
     def max_temp(self) -> float:
         if self._is_master or self._master_setpoint is None:
             return self._abs_max
-        # Non-master: clamp to absolute limits so we never exceed hardware ceiling
         return min(self._abs_max, self._master_setpoint + AIRZONE_ZONE_OFFSET)
 
     @property
@@ -726,17 +722,22 @@ class LoxoneAirzoneZone(ClimateEntity):
         temp = kwargs.get("temperature")
         if temp is None:
             return
-        # Enforce zone limits before sending (Airzone hardware rejects out-of-range values)
         temp = max(self.min_temp, min(self.max_temp, float(temp)))
         self.hass.bus.fire(SENDDOMAIN, {"uuid": self._setpoint_uuid, "value": temp})
+        self._target_temp = temp
+        self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
             self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
+            self._switch_on = False
         else:
             self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "on"})
+            self._switch_on = True
             mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
             self.hass.bus.fire(
                 SENDDOMAIN,
                 {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val},
             )
+            self._mode_value = mode_val
+        self.async_write_ha_state()
