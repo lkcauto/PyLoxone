@@ -5,12 +5,24 @@ Edit the UUIDs below to match your LoxApp3.json.
 Find UUIDs in Loxone Config or via: lox ls -o json | python3 -c
   "import json,sys; d=json.load(sys.stdin); [print(v['type'], v['name'], k) for k,v in d['controls'].items()]"
 
-Airzone mode values (sent to the Radio block):
-  0 = allOff / stop
-  1 = Cool
-  3 = Fan only
-  5 = Heat
-  6 = Dry
+Radio block output numbers mirror Modbus register values — they are NOT
+sequential 1-based output indices. The Airzone Modbus register values are:
+  0   = allOff / stop
+  1   = Cool
+  3   = Fan only
+  5   = Heat (standard)
+  6   = Dry
+  258 = Heat (alternative Modbus encoding used on some Airzone firmware)
+
+Rule for reading activeOutput back from Loxone:
+  val == 1          → Cool
+  val == 3          → Fan
+  val == 6          → Dry
+  val == 5 OR val > 6 → Heat  (covers both 5 and 258 and any future variants)
+  val == 0          → Off / stop
+
+Commands sent TO the Radio block always use 5 for heat (Loxone handles the
+translation; we never need to send 258).
 
 Non-master zone setpoints are always constrained to master_setpoint ± AIRZONE_ZONE_OFFSET.
 This matches the Airzone hardware limit (3°C either side of master).
@@ -25,21 +37,13 @@ AIRZONE_MASTER_SETPOINT_UUID = "20347d11-0155-ea6f-ffff5b4be2d603d4"
 # How far a non-master zone setpoint can deviate from the master (Airzone hardware limit)
 AIRZONE_ZONE_OFFSET = 3.0
 
-# Mapping from HA HVACMode names to the numeric value sent to the Radio block
+# Values sent TO the Radio block (command direction only — always use 5 for heat)
 AIRZONE_MODE_TO_VALUE: dict[str, int] = {
     "cool": 1,
     "heat": 5,
     "fan_only": 3,
     "dry": 6,
     "off": 0,
-}
-
-# Reverse mapping: Radio block value -> HA HVACMode name
-AIRZONE_VALUE_TO_MODE: dict[int, str] = {
-    1: "cool",
-    3: "fan_only",
-    5: "heat",
-    6: "dry",
 }
 
 # One entry per Airzone zone.
