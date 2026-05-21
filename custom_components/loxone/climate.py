@@ -317,6 +317,18 @@ class LoxoneRoomController(LoxoneEntity, ClimateEntity, ABC):
     def max_temp(self) -> float:
         return 35.0
 
+    async def async_turn_on(self) -> None:
+        self.hass.bus.fire(
+            SENDDOMAIN, dict(uuid=self.uuidAction, value="setMode/0")
+        )
+        self.schedule_update_ha_state()
+
+    async def async_turn_off(self) -> None:
+        self.hass.bus.fire(
+            SENDDOMAIN, dict(uuid=self.uuidAction, value="setMode/4")
+        )
+        self.schedule_update_ha_state()
+
     def set_hvac_mode(self, hvac_mode: str):
         mode_map = {
             HVACMode.OFF: 4,
@@ -446,6 +458,18 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
     @property
     def preset_modes(self):
         return [mode["name"] for mode in self._modeList]
+
+    async def async_turn_on(self) -> None:
+        self.hass.bus.fire(
+            SENDDOMAIN, dict(uuid=self.uuidAction, value="setOperatingMode/0")
+        )
+        self.schedule_update_ha_state()
+
+    async def async_turn_off(self) -> None:
+        self.hass.bus.fire(
+            SENDDOMAIN, dict(uuid=self.uuidAction, value="setOperatingMode/-1")
+        )
+        self.schedule_update_ha_state()
 
     def set_hvac_mode(self, hvac_mode: str):
         target_mode = (
