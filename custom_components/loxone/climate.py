@@ -78,11 +78,6 @@ async def async_setup_platform(
 
 
 def _find_control(controls: dict, target_uuid: str) -> dict:
-    """Return the loxconfig control entry for target_uuid.
-
-    Checks both the dict key (common case) and the uuidAction field
-    (fallback) so lookup works regardless of how the JSON is structured.
-    """
     if target_uuid in controls:
         return controls[target_uuid]
     for ctrl in controls.values():
@@ -92,14 +87,6 @@ def _find_control(controls: dict, target_uuid: str) -> dict:
 
 
 def _state_uuid(controls: dict, command_uuid: str, state_key: str) -> str:
-    """Return the state output UUID for a block, falling back to command_uuid.
-
-    Loxone block types and their state key names:
-      InfoOnlyAnalog  → "value"
-      ValueSelector   → "value"
-      Switch          → "active"
-      Radio           → "activeOutput"
-    """
     ctrl = _find_control(controls, command_uuid)
     resolved = ctrl.get("states", {}).get(state_key)
     if resolved:
@@ -117,12 +104,12 @@ def _airzone_mode_from_value(val: int) -> HVACMode:
     """Map a Radio activeOutput Modbus register value to an HVACMode.
 
     Register values mirror Modbus, not sequential output indices:
-      0         → (no active output / stop) — treated as cool as a neutral fallback
-      1         → Cool
-      3         → Fan only
-      5         → Heat (standard encoding)
-      6         → Dry
-      > 6       → Heat (alternative Airzone/Modbus encoding, e.g. 258)
+      0   → Stop (handled upstream as OFF)
+      1   → Cool
+      3   → Fan only
+      5   → Heat (standard encoding)
+      6   → Dry
+      >6  → Heat (alternative Airzone/Modbus encoding, e.g. 258)
     """
     if val == 1:
         return HVACMode.COOL
@@ -132,7 +119,7 @@ def _airzone_mode_from_value(val: int) -> HVACMode:
         return HVACMode.DRY
     if val == 5 or val > 6:
         return HVACMode.HEAT
-    return HVACMode.COOL  # val 0 or any unexpected value
+    return HVACMode.COOL
 
 
 async def async_setup_entry(
@@ -147,58 +134,46 @@ async def async_setup_entry(
 
     for climate in get_all(loxconfig, "IRoomControllerV2"):
         climate = add_room_and_cat_to_value_values(loxconfig, climate)
-        climate.update(
-            {
-                "hass": hass,
-                CONF_HVAC_AUTO_MODE: 0,
-            }
-        )
+        climate.update({"hass": hass, CONF_HVAC_AUTO_MODE: 0})
         entities.append(LoxoneRoomControllerV2(**climate))
 
     for climate in get_all(loxconfig, "IRoomController"):
         climate = add_room_and_cat_to_value_values(loxconfig, climate)
-        climate.update(
-            {
-                "hass": hass,
-                CONF_HVAC_AUTO_MODE: 0,
-            }
-        )
+        climate.update({"hass": hass, CONF_HVAC_AUTO_MODE: 0})
         entities.append(LoxoneRoomController(**climate))
 
     for accontrol in get_all(loxconfig, "AcControl"):
         accontrol = add_room_and_cat_to_value_values(loxconfig, accontrol)
-        accontrol.update(
-            {
-                "hass": hass,
-            }
-        )
+        accontrol.update({"hass": hass})
         entities.append(LoxoneAcControl(**accontrol))
 
     if _HAS_AIRZONE:
         controls = loxconfig.get("controls", {})
 
-        # Resolve shared state UUIDs (same block for all zones)
-        # Radio block: activeOutput carries the selected mode number
         mode_state_uuid = _state_uuid(controls, AIRZONE_GLOBAL_MODE_UUID, "activeOutput")
-        # Master setpoint ValueSelector: value carries the current setpoint
         master_setpoint_state_uuid = _state_uuid(controls, AIRZONE_MASTER_SETPOINT_UUID, "value")
 
-        # Whole House AC: global mode controller mirroring Master Suite temp
         master_zone_cfg = next(z for z in AIRZONE_ZONES if z["is_master"])
+
+        # Whole House AC: subclass of LoxoneAirzoneZone using master zone UUIDs.
+        # Identical behaviour to Master Suite except OFF → Radio=0 (central unit stop).
         master_temp_state_uuid = _state_uuid(controls, master_zone_cfg["temperature_uuid"], "value")
-        entities.append(LoxoneAirzoneGlobalMode(
-            hass,
-            mode_state_uuid=mode_state_uuid,
-            temp_state_uuid=master_temp_state_uuid,
-            setpoint_state_uuid=master_setpoint_state_uuid,
-        ))
+        master_switch_state_uuid = _state_uuid(controls, master_zone_cfg["switch_uuid"], "active")
+        global_cfg = {
+            **master_zone_cfg,
+            "name": "Whole House AC",
+            "unique_id": "airzone_whole_house",
+            "temp_state_uuid": master_temp_state_uuid,
+            "setpoint_state_uuid": master_setpoint_state_uuid,
+            "switch_state_uuid": master_switch_state_uuid,
+            "mode_state_uuid": mode_state_uuid,
+            "master_setpoint_state_uuid": master_setpoint_state_uuid,
+        }
+        entities.append(LoxoneAirzoneGlobalMode(hass, global_cfg))
 
         for zone_cfg in AIRZONE_ZONES:
-            # InfoOnlyAnalog temperature sensor: value carries the current reading
             temp_state_uuid = _state_uuid(controls, zone_cfg["temperature_uuid"], "value")
-            # ValueSelector setpoint: value carries the current setpoint
             setpoint_state_uuid = _state_uuid(controls, zone_cfg["setpoint_uuid"], "value")
-            # Switch damper block: active carries 0.0/1.0 on/off state
             switch_state_uuid = _state_uuid(controls, zone_cfg["switch_uuid"], "active")
 
             enriched_cfg = {
@@ -249,27 +224,17 @@ class LoxoneRoomController(LoxoneEntity, ClimateEntity, ABC):
         if not self.enabled:
             return
         update = False
-
         for key in self._all_uuids & event.data.keys():
             self._stateAttribValues[key] = event.data[key]
             update = True
-
         if update:
             self.async_write_ha_state()
 
     def get_state_value(self, name):
         uuid = self._stateAttribUuids.get(name)
         if isinstance(uuid, list):
-            return [
-                self._stateAttribValues.get(u)
-                for u in uuid
-                if u in self._stateAttribValues
-            ]
-        return (
-            self._stateAttribValues[uuid]
-            if uuid and uuid in self._stateAttribValues
-            else None
-        )
+            return [self._stateAttribValues.get(u) for u in uuid if u in self._stateAttribValues]
+        return self._stateAttribValues[uuid] if uuid and uuid in self._stateAttribValues else None
 
     @property
     def extra_state_attributes(self):
@@ -294,14 +259,12 @@ class LoxoneRoomController(LoxoneEntity, ClimateEntity, ABC):
         temp = kwargs.get("temperature")
         if temp is None:
             return
-
         mode = self.get_state_value("mode")
         temp_idx = self.get_state_value("currHeatTempIx")
         if mode == 2:
             cool_idx = self.get_state_value("currCoolTempIx")
             if cool_idx is not None:
                 temp_idx = cool_idx
-
         if temp_idx is not None:
             self.hass.bus.fire(
                 SENDDOMAIN,
@@ -313,7 +276,6 @@ class LoxoneRoomController(LoxoneEntity, ClimateEntity, ABC):
     def hvac_action(self) -> HVACAction | None:
         valve_heat = self.get_state_value("valveHeat")
         valve_cool = self.get_state_value("valveCool")
-
         if valve_heat and valve_heat > 0:
             return HVACAction.HEATING
         elif valve_cool and valve_cool > 0:
@@ -396,7 +358,6 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
         self._stateAttribValues = {}
         self.type = "RoomControllerV2"
         self._modeList = kwargs["details"]["timerModes"]
-
         self._attr_device_info = get_or_create_device(
             self.unique_id, self.name, self.type, self.room
         )
@@ -418,16 +379,11 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
 
     def get_state_value(self, name):
         uuid = self._stateAttribUuids[name]
-        return (
-            self._stateAttribValues[uuid] if uuid in self._stateAttribValues else None
-        )
+        return self._stateAttribValues[uuid] if uuid in self._stateAttribValues else None
 
     @property
     def extra_state_attributes(self):
-        return {
-            **self._attr_extra_state_attributes,
-            "is_overridden": self.is_overridden,
-        }
+        return {**self._attr_extra_state_attributes, "is_overridden": self.is_overridden}
 
     @property
     def is_overridden(self) -> bool:
@@ -555,9 +511,7 @@ class LoxoneAcControl(LoxoneEntity, ClimateEntity, ABC):
 
     def get_state_value(self, name):
         uuid = self._stateAttribUuids[name]
-        return (
-            self._stateAttribValues[uuid] if uuid in self._stateAttribValues else None
-        )
+        return self._stateAttribValues[uuid] if uuid in self._stateAttribValues else None
 
     @property
     def extra_state_attributes(self):
@@ -599,7 +553,6 @@ class LoxoneAcControl(LoxoneEntity, ClimateEntity, ABC):
                 mode = 4
             case HVACMode.FAN_ONLY:
                 mode = 5
-
         self.hass.bus.fire(
             SENDDOMAIN,
             dict(uuid=self.uuidAction, value="off" if hvac_mode == HVACMode.OFF else "on"),
@@ -703,12 +656,9 @@ class LoxoneAirzoneZone(ClimateEntity):
         self._room = zone_cfg["room"]
         self._is_master = zone_cfg["is_master"]
 
-        # Command UUIDs — used to send commands to Loxone (uuidAction)
-        self._switch_uuid = zone_cfg["switch_uuid"]           # Switch damper on/off
-        self._setpoint_uuid = zone_cfg["setpoint_uuid"]       # ValueSelector set value
-        # AIRZONE_GLOBAL_MODE_UUID used directly when firing mode commands
+        self._switch_uuid = zone_cfg["switch_uuid"]
+        self._setpoint_uuid = zone_cfg["setpoint_uuid"]
 
-        # State UUIDs — the block's states dict output UUIDs; what Loxone uses in WebSocket events
         self._temp_state_uuid = zone_cfg.get("temp_state_uuid", zone_cfg["temperature_uuid"])
         self._setpoint_state_uuid = zone_cfg.get("setpoint_state_uuid", zone_cfg["setpoint_uuid"])
         self._switch_state_uuid = zone_cfg.get("switch_state_uuid", zone_cfg["switch_uuid"])
@@ -717,7 +667,6 @@ class LoxoneAirzoneZone(ClimateEntity):
             "master_setpoint_state_uuid", AIRZONE_MASTER_SETPOINT_UUID
         )
 
-        # Absolute hardware limits for this zone
         self._abs_min = zone_cfg["setpoint_min"]
         self._abs_max = zone_cfg["setpoint_max"]
         self._attr_target_temperature_step = zone_cfg["setpoint_step"]
@@ -821,13 +770,11 @@ class LoxoneAirzoneZone(ClimateEntity):
         return _airzone_mode_from_value(self._mode_value)
 
     async def async_turn_on(self) -> None:
-        """Open the zone damper without changing the global AC mode."""
         self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "on"})
         self._switch_on = True
         self.async_write_ha_state()
 
     async def async_turn_off(self) -> None:
-        """Close the zone damper without changing the global AC mode."""
         self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
         self._switch_on = False
         self.async_write_ha_state()
@@ -859,118 +806,31 @@ class LoxoneAirzoneZone(ClimateEntity):
 
 
 # ------------------ WHOLE HOUSE AC ----------------------------------------------------
-class LoxoneAirzoneGlobalMode(ClimateEntity):
-    """Whole House AC — controls the Toshiba central unit operating mode.
-
-    OFF sets the AC Mode Radio to 0 (Stop), shutting down the central unit entirely.
-    All other modes set the Radio to the corresponding Airzone Modbus value.
-    Temperature and setpoint mirror the Master Suite zone.
+class LoxoneAirzoneGlobalMode(LoxoneAirzoneZone):
+    """Whole House AC — identical to Master Suite zone except OFF stops the Toshiba
+    central unit (Radio=0) instead of closing the master damper.
     """
-
-    _attr_name = "Whole House AC"
-    _attr_unique_id = "airzone_whole_house"
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [
-        HVACMode.OFF,
-        HVACMode.COOL,
-        HVACMode.HEAT,
-        HVACMode.FAN_ONLY,
-        HVACMode.DRY,
-    ]
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _attr_target_temperature_step = 0.5
-    _attr_min_temp = 16.0
-    _attr_max_temp = 30.0
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        mode_state_uuid: str,
-        temp_state_uuid: str,
-        setpoint_state_uuid: str,
-    ) -> None:
-        self.hass = hass
-        self._mode_state_uuid = mode_state_uuid
-        self._temp_state_uuid = temp_state_uuid
-        self._setpoint_state_uuid = setpoint_state_uuid
-
-        self._mode_value: int = 0
-        self._current_temp: float | None = None
-        self._target_temp: float | None = None
-        self._listener = None
-
-        self._watched_uuids = {
-            self._mode_state_uuid,
-            self._temp_state_uuid,
-            self._setpoint_state_uuid,
-        }
-        self._attr_device_info = get_or_create_device(
-            "airzone_whole_house", "Whole House AC", "AirzoneGlobal", "System"
-        )
-        self._attr_extra_state_attributes = {
-            "platform": "loxone",
-            "mode_state_uuid": self._mode_state_uuid,
-        }
-
-    async def async_added_to_hass(self) -> None:
-        self._listener = self.hass.bus.async_listen(EVENT, self._handle_event)
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._listener:
-            self._listener()
-            self._listener = None
-
-    async def _handle_event(self, event) -> None:
-        data: dict = event.data
-        if not (self._watched_uuids & data.keys()):
-            return
-        updated = False
-
-        if self._mode_state_uuid in data:
-            self._mode_value = int(data[self._mode_state_uuid])
-            updated = True
-
-        if self._temp_state_uuid in data:
-            val = data[self._temp_state_uuid]
-            self._current_temp = float(val) if val is not None else None
-            updated = True
-
-        if self._setpoint_state_uuid in data:
-            val = data[self._setpoint_state_uuid]
-            self._target_temp = float(val) if val is not None else None
-            updated = True
-
-        if updated:
-            self.async_write_ha_state()
 
     @property
     def hvac_mode(self) -> HVACMode:
-        if self._mode_value == 0:
+        # Treat Radio=0 (Stop) as OFF regardless of damper state
+        if self._mode_value == 0 or not self._switch_on:
             return HVACMode.OFF
         return _airzone_mode_from_value(self._mode_value)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            mode_val = 0  # Radio = 0 → Stop the Toshiba central unit
+            # Stop the Toshiba central unit entirely
+            self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": 0})
+            self._mode_value = 0
+            self._switch_on = False
         else:
+            self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "on"})
+            self._switch_on = True
             mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
-        self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val})
-        self._mode_value = mode_val
-        self.async_write_ha_state()
-
-    @property
-    def current_temperature(self) -> float | None:
-        return self._current_temp
-
-    @property
-    def target_temperature(self) -> float | None:
-        return self._target_temp
-
-    async def async_set_temperature(self, **kwargs) -> None:
-        temp = kwargs.get("temperature")
-        if temp is None:
-            return
-        temp = max(self._attr_min_temp, min(self._attr_max_temp, float(temp)))
-        self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_MASTER_SETPOINT_UUID, "value": temp})
-        self._target_temp = temp
+            self.hass.bus.fire(
+                SENDDOMAIN,
+                {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val},
+            )
+            self._mode_value = mode_val
         self.async_write_ha_state()
