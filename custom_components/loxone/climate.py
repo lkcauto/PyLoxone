@@ -823,9 +823,11 @@ class LoxoneAirzoneZone(ClimateEntity):
 
 # ------------------ WHOLE HOUSE AC ----------------------------------------------------
 class LoxoneAirzoneGlobalMode(ClimateEntity):
-    """Whole House AC — controls only the global AC Mode Radio.
+    """Whole House AC — controls the global AC Mode Radio.
 
-    Never touches zone damper switches. OFF=Radio 0 (Toshiba stop).
+    Mode changes (Cool/Heat/Fan/Dry) fire to the Radio only — no damper involvement.
+    OFF sends Radio=0 (Toshiba stop) AND closes all three zone dampers so the
+    master zone cannot hold the mode active.
     Temperature and setpoint mirror the Master Suite zone for context.
     """
 
@@ -912,9 +914,17 @@ class LoxoneAirzoneGlobalMode(ClimateEntity):
         return _airzone_mode_from_value(self._mode_value)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        mode_val = 0 if hvac_mode == HVACMode.OFF else AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
-        self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val})
-        self._mode_value = mode_val
+        if hvac_mode == HVACMode.OFF:
+            # Stop the Toshiba central unit and close all zone dampers
+            self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": 0})
+            for zone in AIRZONE_ZONES:
+                self.hass.bus.fire(SENDDOMAIN, {"uuid": zone["switch_uuid"], "value": "off"})
+            self._mode_value = 0
+        else:
+            # Mode change only — dampers are controlled per zone
+            mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
+            self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val})
+            self._mode_value = mode_val
         self.async_write_ha_state()
 
     @property
