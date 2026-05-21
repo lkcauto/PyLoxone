@@ -815,6 +815,18 @@ class LoxoneAirzoneZone(ClimateEntity):
             return HVACMode.OFF
         return _airzone_mode_from_value(self._mode_value)
 
+    async def async_turn_on(self) -> None:
+        """Open the zone damper without changing the global AC mode."""
+        self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "on"})
+        self._switch_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self) -> None:
+        """Close the zone damper without changing the global AC mode."""
+        self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
+        self._switch_on = False
+        self.async_write_ha_state()
+
     async def async_set_temperature(self, **kwargs) -> None:
         temp = kwargs.get("temperature")
         if temp is None:
