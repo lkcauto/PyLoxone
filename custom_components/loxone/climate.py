@@ -156,7 +156,7 @@ async def async_setup_entry(
         master_zone_cfg = next(z for z in AIRZONE_ZONES if z["is_master"])
 
         # Whole House AC: subclass of LoxoneAirzoneZone using master zone UUIDs.
-        # Identical behaviour to Master Suite except OFF → Radio=0 (central unit stop).
+        # OFF sends Radio=0 AND closes all zone dampers.
         master_temp_state_uuid = _state_uuid(controls, master_zone_cfg["temperature_uuid"], "value")
         master_switch_state_uuid = _state_uuid(controls, master_zone_cfg["switch_uuid"], "active")
         global_cfg = {
@@ -807,21 +807,23 @@ class LoxoneAirzoneZone(ClimateEntity):
 
 # ------------------ WHOLE HOUSE AC ----------------------------------------------------
 class LoxoneAirzoneGlobalMode(LoxoneAirzoneZone):
-    """Whole House AC — identical to Master Suite zone except OFF stops the Toshiba
-    central unit (Radio=0) instead of closing the master damper.
+    """Whole House AC — identical to Master Suite zone except:
+    - OFF sends Radio=0 (Toshiba central unit stop) AND closes all zone dampers.
+    - hvac_mode shows OFF whenever Radio=0, regardless of damper state.
     """
 
     @property
     def hvac_mode(self) -> HVACMode:
-        # Treat Radio=0 (Stop) as OFF regardless of damper state
         if self._mode_value == 0 or not self._switch_on:
             return HVACMode.OFF
         return _airzone_mode_from_value(self._mode_value)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            # Stop the Toshiba central unit entirely
+            # Stop the Toshiba central unit and close every zone damper
             self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": 0})
+            for zone in AIRZONE_ZONES:
+                self.hass.bus.fire(SENDDOMAIN, {"uuid": zone["switch_uuid"], "value": "off"})
             self._mode_value = 0
             self._switch_on = False
         else:
