@@ -81,8 +81,15 @@ def _find_control(controls: dict, target_uuid: str) -> dict:
     if target_uuid in controls:
         return controls[target_uuid]
     for ctrl in controls.values():
+        if not isinstance(ctrl, dict):
+            continue
         if ctrl.get("uuidAction") == target_uuid:
             return ctrl
+        sub = ctrl.get("subControls", {})
+        if sub:
+            result = _find_control(sub, target_uuid)
+            if result:
+                return result
     return {}
 
 
@@ -153,7 +160,6 @@ async def async_setup_entry(
         mode_state_uuid = _state_uuid(controls, AIRZONE_GLOBAL_MODE_UUID, "activeOutput")
         master_setpoint_state_uuid = _state_uuid(controls, AIRZONE_MASTER_SETPOINT_UUID, "value")
 
-        # Whole House AC: mode-only controller, mirrors Master Suite temp for display
         master_zone_cfg = next(z for z in AIRZONE_ZONES if z["is_master"])
         master_temp_state_uuid = _state_uuid(controls, master_zone_cfg["temperature_uuid"], "value")
         entities.append(LoxoneAirzoneGlobalMode(
@@ -806,7 +812,6 @@ class LoxoneAirzoneZone(ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            # Close this zone's damper only; global AC mode is unchanged
             self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
             self._switch_on = False
         else:
@@ -915,13 +920,11 @@ class LoxoneAirzoneGlobalMode(ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            # Stop the Toshiba central unit and close all zone dampers
             self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": 0})
             for zone in AIRZONE_ZONES:
                 self.hass.bus.fire(SENDDOMAIN, {"uuid": zone["switch_uuid"], "value": "off"})
             self._mode_value = 0
         else:
-            # Mode change only — dampers are controlled per zone
             mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
             self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val})
             self._mode_value = mode_val
