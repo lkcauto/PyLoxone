@@ -183,6 +183,16 @@ async def async_setup_entry(
         # Master setpoint ValueSelector: value carries the current setpoint
         master_setpoint_state_uuid = _state_uuid(controls, AIRZONE_MASTER_SETPOINT_UUID, "value")
 
+        # Whole House AC: global mode controller mirroring Master Suite temp
+        master_zone_cfg = next(z for z in AIRZONE_ZONES if z["is_master"])
+        master_temp_state_uuid = _state_uuid(controls, master_zone_cfg["temperature_uuid"], "value")
+        entities.append(LoxoneAirzoneGlobalMode(
+            hass,
+            mode_state_uuid=mode_state_uuid,
+            temp_state_uuid=master_temp_state_uuid,
+            setpoint_state_uuid=master_setpoint_state_uuid,
+        ))
+
         for zone_cfg in AIRZONE_ZONES:
             # InfoOnlyAnalog temperature sensor: value carries the current reading
             temp_state_uuid = _state_uuid(controls, zone_cfg["temperature_uuid"], "value")
@@ -672,14 +682,9 @@ class LoxoneAcControl(LoxoneEntity, ClimateEntity, ABC):
 class LoxoneAirzoneZone(ClimateEntity):
     """One Airzone zone: raw Loxone blocks (damper switch + setpoint + temp sensor).
 
-    All zones control the global AC operating mode — Loxone virtualises the AC Mode
-    Radio block to all zones, so any zone can change the global mode.
-    Non-master zones control only their damper and setpoint; their min/max
-    temperature range tracks the master setpoint ± AIRZONE_ZONE_OFFSET so that
-    HA's UI slider always enforces the Airzone hardware constraint.
-
-    Command UUIDs (uuidAction) are kept separately from state UUIDs (states dict)
-    because Loxone uses different UUIDs for sending commands vs receiving state events.
+    OFF closes this zone's damper only — other zones are unaffected.
+    Selecting any mode opens this zone's damper and sets the global AC mode.
+    Non-master zones track the master setpoint ± AIRZONE_ZONE_OFFSET for slider limits.
     """
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -838,6 +843,7 @@ class LoxoneAirzoneZone(ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
+            # Close this zone's damper only; global AC mode is unchanged
             self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
             self._switch_on = False
         else:
@@ -849,4 +855,122 @@ class LoxoneAirzoneZone(ClimateEntity):
                 {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val},
             )
             self._mode_value = mode_val
+        self.async_write_ha_state()
+
+
+# ------------------ WHOLE HOUSE AC ----------------------------------------------------
+class LoxoneAirzoneGlobalMode(ClimateEntity):
+    """Whole House AC — controls the Toshiba central unit operating mode.
+
+    OFF sets the AC Mode Radio to 0 (Stop), shutting down the central unit entirely.
+    All other modes set the Radio to the corresponding Airzone Modbus value.
+    Temperature and setpoint mirror the Master Suite zone.
+    """
+
+    _attr_name = "Whole House AC"
+    _attr_unique_id = "airzone_whole_house"
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_hvac_modes = [
+        HVACMode.OFF,
+        HVACMode.COOL,
+        HVACMode.HEAT,
+        HVACMode.FAN_ONLY,
+        HVACMode.DRY,
+    ]
+    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
+    _attr_target_temperature_step = 0.5
+    _attr_min_temp = 16.0
+    _attr_max_temp = 30.0
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        mode_state_uuid: str,
+        temp_state_uuid: str,
+        setpoint_state_uuid: str,
+    ) -> None:
+        self.hass = hass
+        self._mode_state_uuid = mode_state_uuid
+        self._temp_state_uuid = temp_state_uuid
+        self._setpoint_state_uuid = setpoint_state_uuid
+
+        self._mode_value: int = 0
+        self._current_temp: float | None = None
+        self._target_temp: float | None = None
+        self._listener = None
+
+        self._watched_uuids = {
+            self._mode_state_uuid,
+            self._temp_state_uuid,
+            self._setpoint_state_uuid,
+        }
+        self._attr_device_info = get_or_create_device(
+            "airzone_whole_house", "Whole House AC", "AirzoneGlobal", "System"
+        )
+        self._attr_extra_state_attributes = {
+            "platform": "loxone",
+            "mode_state_uuid": self._mode_state_uuid,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        self._listener = self.hass.bus.async_listen(EVENT, self._handle_event)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._listener:
+            self._listener()
+            self._listener = None
+
+    async def _handle_event(self, event) -> None:
+        data: dict = event.data
+        if not (self._watched_uuids & data.keys()):
+            return
+        updated = False
+
+        if self._mode_state_uuid in data:
+            self._mode_value = int(data[self._mode_state_uuid])
+            updated = True
+
+        if self._temp_state_uuid in data:
+            val = data[self._temp_state_uuid]
+            self._current_temp = float(val) if val is not None else None
+            updated = True
+
+        if self._setpoint_state_uuid in data:
+            val = data[self._setpoint_state_uuid]
+            self._target_temp = float(val) if val is not None else None
+            updated = True
+
+        if updated:
+            self.async_write_ha_state()
+
+    @property
+    def hvac_mode(self) -> HVACMode:
+        if self._mode_value == 0:
+            return HVACMode.OFF
+        return _airzone_mode_from_value(self._mode_value)
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        if hvac_mode == HVACMode.OFF:
+            mode_val = 0  # Radio = 0 → Stop the Toshiba central unit
+        else:
+            mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
+        self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val})
+        self._mode_value = mode_val
+        self.async_write_ha_state()
+
+    @property
+    def current_temperature(self) -> float | None:
+        return self._current_temp
+
+    @property
+    def target_temperature(self) -> float | None:
+        return self._target_temp
+
+    async def async_set_temperature(self, **kwargs) -> None:
+        temp = kwargs.get("temperature")
+        if temp is None:
+            return
+        temp = max(self._attr_min_temp, min(self._attr_max_temp, float(temp)))
+        self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_MASTER_SETPOINT_UUID, "value": temp})
+        self._target_temp = temp
         self.async_write_ha_state()
