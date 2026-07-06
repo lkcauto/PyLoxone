@@ -848,8 +848,8 @@ class LoxoneAirzoneGlobalMode(ClimateEntity):
     ]
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
     _attr_target_temperature_step = 0.5
-    _attr_min_temp = 16.0
-    _attr_max_temp = 30.0
+    _attr_min_temp = 18.0
+    _attr_max_temp = 26.0
 
     def __init__(
         self,

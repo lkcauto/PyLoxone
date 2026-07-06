@@ -35,8 +35,6 @@ class LoxoneDimmer(LoxoneEntity, LightEntity):
         self._light_controller_name = kwargs.get("lightcontroller_name", None)
 
         self._name = self._attr_name
-        if self._light_controller_name:
-            self._attr_name = f"{self._light_controller_name}-{self._attr_name}"
 
         if self._light_controller_id:
             self.type = "LightControllerV2"
