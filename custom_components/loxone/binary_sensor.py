@@ -84,6 +84,20 @@ async def async_setup_entry(
         sensor.update({"type": "smoke"})
         entities.append(LoxoneDigitalSensor(**sensor))
 
+    for intercom in get_all(loxconfig, "IntercomV2"):
+        intercom = add_room_and_cat_to_value_values(loxconfig, intercom)
+        bell_uuid = intercom.get("states", {}).get("bell")
+        if bell_uuid:
+            bell = {
+                "uuidAction": bell_uuid,
+                "states": {"active": bell_uuid},
+                "type": "digital",
+                "room": intercom.get("room", ""),
+                "cat": intercom.get("cat", ""),
+                "name": intercom["name"] + " - Bell",
+            }
+            entities.append(LoxoneDigitalSensor(**bell))
+
     @callback
     def async_add_binary_sensors(_):
         async_add_entities(_, True)

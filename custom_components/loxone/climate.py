@@ -40,6 +40,25 @@ except ImportError:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Shared (hass.data) key for the last non-Stop Airzone Radio mode value seen by
+# any zone or the Whole House AC entity. Lets turning a zone back on restore
+# whatever mode was active before the system was stopped, instead of opening
+# a damper into a stopped system.
+DATA_LAST_ACTIVE_AIRZONE_MODE = "loxone_last_active_airzone_mode"
+
+# Shared (hass.data) key tracking each zone's current on/off switch state, keyed
+# by zone unique_id. Lets turning off the last remaining zone also stop the
+# global Radio, so "Operation Mode" doesn't keep showing Cool/Heat/etc. when
+# nothing is actually running.
+DATA_ZONE_SWITCH_STATES = "loxone_zone_switch_states"
+
+# Shared (hass.data) key: set of zone unique_ids that were on the last time
+# any zone was on. Lets reactivating a mode from Stop (with all zones off)
+# automatically restore whichever zones were last running, instead of
+# silently doing nothing (no dampers open) or requiring the user to manually
+# re-pick zones every time.
+DATA_LAST_ACTIVE_ZONES = "loxone_last_active_zones"
+
 
 OPMODES = {
     None: HVACMode.OFF,
@@ -127,6 +146,17 @@ def _airzone_mode_from_value(val: int) -> HVACMode:
     if val == 5 or val > 6:
         return HVACMode.HEAT
     return HVACMode.COOL
+
+
+# Entity providing the real outdoor temperature reading, used by the Fan-only
+# half-degree shift direction (Airzone Sleep-style whole/half tracking, see
+# LoxoneAirzoneZone._handle_event).
+OUTDOOR_TEMPERATURE_ENTITY_ID = "sensor.loxone_outdoor_temperature_outdoor_temperature"
+
+
+def _is_half_degree(value: float) -> bool:
+    """Return True if value's fractional part is .5 (robust to float error)."""
+    return round(value * 2) % 2 == 1
 
 
 async def async_setup_entry(
@@ -691,7 +721,11 @@ class LoxoneAirzoneZone(ClimateEntity):
 
         self._abs_min = zone_cfg["setpoint_min"]
         self._abs_max = zone_cfg["setpoint_max"]
-        self._attr_target_temperature_step = zone_cfg["setpoint_step"]
+        # Base step size (1.0 for non-master zones, 0.5 for master). Non-master
+        # zones temporarily switch to a 0.5 step whenever the master setpoint
+        # is currently sitting on a half-degree value — see the
+        # target_temperature_step property below.
+        self._configured_step = zone_cfg["setpoint_step"]
 
         self._attr_supported_features = (
             ClimateEntityFeature.TARGET_TEMPERATURE
@@ -704,6 +738,12 @@ class LoxoneAirzoneZone(ClimateEntity):
         self._switch_on: bool = False
         self._mode_value: int = 0
         self._master_setpoint: float | None = None
+
+        # Tracks whether the master setpoint was last seen at a half-degree
+        # value, so we can detect whole<->half *transitions* (not just any
+        # master change) and shift/restore this zone's own setpoint to match.
+        self._master_setpoint_is_half: bool | None = None
+        self._pre_half_shift_temp: float | None = None
 
         self._attr_device_info = get_or_create_device(
             zone_cfg["unique_id"], zone_cfg["name"], "AirzoneZone", zone_cfg["room"]
@@ -752,18 +792,87 @@ class LoxoneAirzoneZone(ClimateEntity):
         if self._switch_state_uuid in data:
             self._switch_on = bool(data[self._switch_state_uuid])
             updated = True
+            self.hass.data.setdefault(DATA_ZONE_SWITCH_STATES, {})[
+                self._attr_unique_id
+            ] = self._switch_on
+            if self._switch_on:
+                self.hass.data.setdefault(DATA_LAST_ACTIVE_ZONES, set()).add(
+                    self._attr_unique_id
+                )
+            else:
+                self._stop_system_if_all_zones_off()
 
         if self._mode_state_uuid in data:
             self._mode_value = int(data[self._mode_state_uuid])
             updated = True
+            if self._mode_value != 0:
+                self.hass.data[DATA_LAST_ACTIVE_AIRZONE_MODE] = self._mode_value
 
         if self._master_setpoint_state_uuid in data:
             val = data[self._master_setpoint_state_uuid]
             self._master_setpoint = float(val) if val is not None else None
             updated = True
+            if not self._is_master and self._master_setpoint is not None:
+                self._handle_master_half_transition()
 
         if updated:
             self.async_write_ha_state()
+
+    def _half_shift_delta(self) -> float:
+        """Direction/size of the whole<->half tracking shift for this zone.
+
+        Heat always shifts the zone up; Cool/Dry always shift it down.
+        Fan-only depends on whether it's warmer or colder than 20°C outside
+        (mirrors whichever of Cool/Heat is more appropriate for the weather).
+        """
+        mode = _airzone_mode_from_value(self._mode_value)
+        if mode == HVACMode.HEAT:
+            return 0.5
+        if mode in (HVACMode.COOL, HVACMode.DRY):
+            return -0.5
+        if mode == HVACMode.FAN_ONLY:
+            outdoor_state = self.hass.states.get(OUTDOOR_TEMPERATURE_ENTITY_ID)
+            try:
+                outdoor_temp = float(outdoor_state.state) if outdoor_state else None
+            except (ValueError, TypeError):
+                outdoor_temp = None
+            if outdoor_temp is not None and outdoor_temp > 20:
+                return -0.5
+            return 0.5
+        return 0.0
+
+    def _handle_master_half_transition(self) -> None:
+        """Shift/restore this zone's setpoint when master crosses a whole<->half boundary.
+
+        Only fires on the transition itself (whole->half or half->whole) —
+        arbitrary whole-to-whole or half-to-half master moves leave this
+        zone's setpoint untouched.
+        """
+        was_half = self._master_setpoint_is_half
+        is_half = _is_half_degree(self._master_setpoint)
+        self._master_setpoint_is_half = is_half
+
+        if was_half is None or was_half == is_half or self._target_temp is None:
+            return
+
+        if is_half:
+            # Whole -> half: remember the current whole-number value and shift.
+            self._pre_half_shift_temp = self._target_temp
+            new_temp = self._target_temp + self._half_shift_delta()
+        else:
+            # Half -> whole: restore the remembered value (or hold current if
+            # we never captured one, e.g. entity started up mid-shift).
+            new_temp = (
+                self._pre_half_shift_temp
+                if self._pre_half_shift_temp is not None
+                else self._target_temp
+            )
+            self._pre_half_shift_temp = None
+
+        new_temp = max(self.min_temp, min(self.max_temp, new_temp))
+        if new_temp != self._target_temp:
+            self.hass.bus.fire(SENDDOMAIN, {"uuid": self._setpoint_uuid, "value": new_temp})
+            self._target_temp = new_temp
 
     @property
     def min_temp(self) -> float:
@@ -776,6 +885,12 @@ class LoxoneAirzoneZone(ClimateEntity):
         if self._is_master or self._master_setpoint is None:
             return self._abs_max
         return min(self._abs_max, self._master_setpoint + AIRZONE_ZONE_OFFSET)
+
+    @property
+    def target_temperature_step(self) -> float:
+        if not self._is_master and self._master_setpoint_is_half:
+            return 0.5
+        return self._configured_step
 
     @property
     def current_temperature(self) -> float | None:
@@ -794,12 +909,49 @@ class LoxoneAirzoneZone(ClimateEntity):
     async def async_turn_on(self) -> None:
         self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "on"})
         self._switch_on = True
+        self.hass.data.setdefault(DATA_ZONE_SWITCH_STATES, {})[
+            self._attr_unique_id
+        ] = True
+        self.hass.data.setdefault(DATA_LAST_ACTIVE_ZONES, set()).add(
+            self._attr_unique_id
+        )
+        if self._mode_value == 0:
+            # System is currently stopped — opening this damper alone would do
+            # nothing, so restore whichever mode was last active.
+            last_mode = self.hass.data.get(DATA_LAST_ACTIVE_AIRZONE_MODE, 1)
+            self.hass.bus.fire(
+                SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": last_mode}
+            )
+            self._mode_value = last_mode
         self.async_write_ha_state()
 
     async def async_turn_off(self) -> None:
         self.hass.bus.fire(SENDDOMAIN, {"uuid": self._switch_uuid, "value": "off"})
         self._switch_on = False
+        self.hass.data.setdefault(DATA_ZONE_SWITCH_STATES, {})[
+            self._attr_unique_id
+        ] = False
+        self._stop_system_if_all_zones_off()
         self.async_write_ha_state()
+
+    def _stop_system_if_all_zones_off(self) -> None:
+        """Stop the global Radio once every zone is confirmed off.
+
+        Runs from both the HA-initiated turn_off path and from Loxone-reported
+        switch-state events (e.g. the initial state sync on startup), since
+        either can be the source of the last zone turning off.
+        """
+        zone_states = self.hass.data.setdefault(DATA_ZONE_SWITCH_STATES, {})
+        all_zone_ids = {z["unique_id"] for z in AIRZONE_ZONES}
+        all_zones_known_off = all_zone_ids <= zone_states.keys() and not any(
+            zone_states[uid] for uid in all_zone_ids
+        )
+        if self._mode_value != 0 and all_zones_known_off:
+            # Nothing is asking for air anymore — stop the whole system too
+            # instead of leaving the Radio (and "Operation Mode") showing a
+            # mode that's doing nothing.
+            self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": 0})
+            self._mode_value = 0
 
     async def async_set_temperature(self, **kwargs) -> None:
         temp = kwargs.get("temperature")
@@ -848,8 +1000,8 @@ class LoxoneAirzoneGlobalMode(ClimateEntity):
     ]
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
     _attr_target_temperature_step = 0.5
-    _attr_min_temp = 18.0
-    _attr_max_temp = 26.0
+    _attr_min_temp = 17.5
+    _attr_max_temp = 26.5
 
     def __init__(
         self,
@@ -898,6 +1050,8 @@ class LoxoneAirzoneGlobalMode(ClimateEntity):
         if self._mode_state_uuid in data:
             self._mode_value = int(data[self._mode_state_uuid])
             updated = True
+            if self._mode_value != 0:
+                self.hass.data[DATA_LAST_ACTIVE_AIRZONE_MODE] = self._mode_value
 
         if self._temp_state_uuid in data:
             val = data[self._temp_state_uuid]
@@ -928,6 +1082,22 @@ class LoxoneAirzoneGlobalMode(ClimateEntity):
             mode_val = AIRZONE_MODE_TO_VALUE.get(hvac_mode.value, 1)
             self.hass.bus.fire(SENDDOMAIN, {"uuid": AIRZONE_GLOBAL_MODE_UUID, "value": mode_val})
             self._mode_value = mode_val
+
+            zone_states = self.hass.data.setdefault(DATA_ZONE_SWITCH_STATES, {})
+            all_zone_ids = {z["unique_id"] for z in AIRZONE_ZONES}
+            all_zones_currently_off = not any(
+                zone_states.get(uid) for uid in all_zone_ids
+            )
+            if all_zones_currently_off:
+                # Nothing is on to actually carry this mode — reopen whichever
+                # zones were last running (or all of them, if we've never
+                # seen any) instead of silently doing nothing.
+                zones_to_restore = self.hass.data.get(DATA_LAST_ACTIVE_ZONES) or all_zone_ids
+                for zone in AIRZONE_ZONES:
+                    if zone["unique_id"] in zones_to_restore:
+                        self.hass.bus.fire(
+                            SENDDOMAIN, {"uuid": zone["switch_uuid"], "value": "on"}
+                        )
         self.async_write_ha_state()
 
     @property
